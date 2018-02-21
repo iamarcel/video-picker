@@ -5,6 +5,7 @@ Application to pick single-sentence clips from a video
 """
 
 import sys
+from subprocess import call
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -19,6 +20,11 @@ class Main:
         self.build_ui()
         self.build_gst()
 
+        self.filename = ''
+        self.current_subtitle = ""
+        self.current_subtitle_duration = 0
+        self.current_subtitle_start = 0
+
     def build_ui(self):
         self.window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
         self.window.set_title("Video Picker")
@@ -32,9 +38,12 @@ class Main:
         self.video_window.connect('realize', self.on_realize_video_window)
         vbox.add(self.video_window)
 
+        self.subtitle_label = Gtk.Label("...")
+        vbox.pack_start(self.subtitle_label, False, False, 2)
+
         hbox = Gtk.HBox()
         hbox.set_border_width(10)
-        vbox.pack_start(hbox, False, False, 0)
+        vbox.pack_start(hbox, False, False, 2)
 
         hbox.pack_start(Gtk.Label(), False, False, 0)
 
@@ -56,6 +65,12 @@ class Main:
         self.pause_button.connect('clicked', self.on_click_pause)
         hbox.pack_start(self.pause_button, False, False, 2)
 
+        self.pick_button = (
+            Gtk.Button(image=Gtk.Image.new_from_stock(Gtk.STOCK_COLOR_PICKER,
+                                                      Gtk.IconSize.BUTTON)))
+        self.pick_button.connect('clicked', self.on_click_pick)
+        hbox.pack_start(self.pick_button, False, False, 2)
+
         self.exit_button = Gtk.Button("Exit")
         self.exit_button.connect('clicked', self.on_click_exit)
         hbox.pack_start(self.exit_button, False, False, 2)
@@ -76,6 +91,12 @@ class Main:
         self.gst_playbin = Gst.ElementFactory.make('playbin')
         self.gst_playbin.set_property('subtitle-font-desc', 'Sans, 18')
         self.gst_pipeline.add(self.gst_playbin)
+
+        self.gst_subtitle_sink = Gst.ElementFactory.make('appsink')
+        self.gst_subtitle_sink.set_property('emit-signals', True)
+        self.gst_subtitle_sink.connect('new-sample', self.on_subtitle_sample, self.gst_subtitle_sink)
+
+        self.gst_playbin.set_property('text-sink', self.gst_subtitle_sink)
 
         bus = self.gst_pipeline.get_bus()
         bus.add_signal_watch()
@@ -143,8 +164,8 @@ class Main:
         response = dialog.run()
 
         if response == Gtk.ResponseType.OK:
-            self.gst_playbin.set_property('uri', 'file://' +
-                                          dialog.get_filename())
+            self.filename = dialog.get_filename()
+            self.gst_playbin.set_property('uri', 'file://' + self.filename)
             self.gst_play()
         elif response == Gtk.ResponseType.CANCEL:
             print("Cancelled file dialog")
@@ -163,6 +184,43 @@ class Main:
     def on_click_exit(self, widget, data=None):
         self.gst_pipeline.set_state(Gst.State.NULL)
         Gtk.main_quit()
+
+    def on_click_pick(self, widget, data=None):
+        # Find the current position
+        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        if not response:
+            raise Exception("Could not get playback position")
+
+        # Find the start and endpoints of the current subtitle
+        start = self.current_subtitle_start / Gst.SECOND
+        duration = self.current_subtitle_duration / Gst.SECOND
+
+        # Fetch the current subtitle
+        subtitle = self.current_subtitle
+
+        # Extract the image sequence for this subtitle with ffmpeg
+        command = 'ffmpeg -ss ' + str(start) + ' -i \'' + self.filename + '\' -t ' + str(duration) + ' test-%d.jpg'
+        print(command)
+        call(command, shell=True)
+
+        # Store the results in the JSON data file
+        return
+
+    def on_subtitle_sample(self, sink, data):
+        sample = sink.emit('pull-sample')
+        buf = sample.get_buffer()
+
+        self.current_subtitle = str(buf.extract_dup(0, buf.get_size()))
+        self.subtitle_label.set_markup(self.current_subtitle)
+
+        self.current_subtitle_duration = buf.duration
+
+        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        if not response:
+            raise Exception("Could not get playback position")
+        self.current_subtitle_start = position
+
+        return False
 
     def on_message(self, bus, message):
         t = message.type
