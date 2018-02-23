@@ -5,7 +5,10 @@ Application to pick single-sentence clips from a video
 """
 
 import sys
-from subprocess import call
+import os
+import subprocess
+import json
+import math
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -16,7 +19,13 @@ from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib  # noqa: E40
 
 
 class Main:
-    def __init__(self):
+
+    def __init__(self, config_file='config.json'):
+        self.config_file = config_file
+        self.config = {}
+        with open(config_file) as config_file:
+            self.config = json.load(config_file)
+
         self.build_ui()
         self.build_gst()
 
@@ -117,6 +126,11 @@ class Main:
             print("ERROR: Could not pause")
             self.gst_pipeline.set_state(Gst.State.NULL)
 
+    def clip_id(self):
+        filename = os.path.basename(self.filename)
+        return (filename.split('.')[-2].split('-')[-1] +
+                str(self.current_subtitle_start))
+
     def update_slider(self):
         if self.gst_state == Gst.State.NULL or self.gst_state == Gst.State.READY:
             # Disable slider when not playing
@@ -144,6 +158,35 @@ class Main:
         self.slider.set_sensitive(True)
 
         return True
+
+    def save_clip(self, config_file='config.json'):
+        video_pad = self.gst_playbin.emit('get-video-pad', 0)
+        response = video_pad.get_current_caps().get_structure(0).get_fraction('framerate')
+        if not response[0]:
+            raise Exception("Could not get framerate")
+
+        framerate = float(response[1]) / float(response[2])
+        start = math.floor(float(self.current_subtitle_start) * framerate /
+                           Gst.SECOND)
+        duration = math.ceil(float(self.current_subtitle_duration) * framerate
+                             / Gst.SECOND)
+
+        clip = {
+            'id': self.clip_id(),
+            'start': start,
+            'end': start + duration,
+            'scale': 4.5,
+            'center': [568, 696],  # FIXME
+            'points_2d': [],
+            'points_3d': [],
+            'subtitle': self.current_subtitle
+        }
+
+        self.config['clips'].append(clip)
+
+        with open(self.config_file, 'w') as config_file:
+            json.dump(self.config, config_file, indent=2)
+            print("Wrote " + str(config_file))
 
     def on_slider_changed(self, slider_widget, data=None):
         position = slider_widget.get_value()
@@ -192,19 +235,24 @@ class Main:
             raise Exception("Could not get playback position")
 
         # Find the start and endpoints of the current subtitle
-        start = self.current_subtitle_start / Gst.SECOND
-        duration = self.current_subtitle_duration / Gst.SECOND
+        start = float(self.current_subtitle_start) / Gst.SECOND
+        duration = float(self.current_subtitle_duration) / Gst.SECOND
 
         # Fetch the current subtitle
         subtitle = self.current_subtitle
 
         # Extract the image sequence for this subtitle with ffmpeg
-        command = 'ffmpeg -ss ' + str(start) + ' -i \'' + self.filename + '\' -t ' + str(duration) + ' test-%d.jpg'
+        subprocess.check_call('mkdir -p ' + self.config['image_root'], shell=True)
+        command = ('ffmpeg -ss ' + str(start) +
+                   ' -i \'' + self.filename + '\' -t ' +
+                   str(duration) +
+                   ' ' + self.config['image_root'] + self.clip_id() +
+                   '-%d' + self.config['image_extension'])
         print(command)
-        call(command, shell=True)
+        subprocess.check_call(command, shell=True)
 
         # Store the results in the JSON data file
-        return
+        self.save_clip()
 
     def on_subtitle_sample(self, sink, data):
         sample = sink.emit('pull-sample')
