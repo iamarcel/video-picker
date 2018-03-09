@@ -7,6 +7,7 @@ Application to pick single-sentence clips from a video
 import sys
 import os
 import subprocess
+import threading
 import json
 import math
 
@@ -15,7 +16,7 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('GdkX11', '3.0')
-from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib  # noqa: E402
+from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib, Gdk  # noqa: E402
 
 
 class Main:
@@ -33,6 +34,10 @@ class Main:
         self.current_subtitle = ""
         self.current_subtitle_duration = 0
         self.current_subtitle_start = 0
+
+        self.current_scene_start = 0
+        self.next_scene_start = 0
+        self.record_current_scene = False
 
     def build_ui(self):
         self.window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
@@ -79,6 +84,14 @@ class Main:
                                                       Gtk.IconSize.BUTTON)))
         self.pick_button.connect('clicked', self.on_click_pick)
         hbox.pack_start(self.pick_button, False, False, 2)
+
+        self.record_button = (
+            Gtk.ToggleButton(image=Gtk.Image.new_from_stock(Gtk.STOCK_MEDIA_RECORD,
+                                                            Gtk.IconSize.BUTTON)))
+        self.record_button.set_active(False)
+        self.record_button.set_relief(Gtk.ReliefStyle.NONE)
+        self.record_button_clicked_id = self.record_button.connect('toggled', self.on_click_record)
+        hbox.pack_start(self.record_button, False, False, 2)
 
         self.exit_button = Gtk.Button("Exit")
         self.exit_button.connect('clicked', self.on_click_exit)
@@ -145,7 +158,9 @@ class Main:
         if not response:
             raise Exception("Could not get playback duration")
 
+        self.slider.handler_block(self.slider_update_signal_id)
         self.slider.set_range(0, duration / Gst.SECOND)
+        self.slider.handler_unblock(self.slider_update_signal_id)
 
         response, position = self.gst_playbin.query_position(Gst.Format.TIME)
         if not response:
@@ -153,11 +168,78 @@ class Main:
 
         self.slider.handler_block(self.slider_update_signal_id)
         self.slider.set_value(float(position) / Gst.SECOND)
+        self.slider.set_sensitive(True)
         self.slider.handler_unblock(self.slider_update_signal_id)
 
-        self.slider.set_sensitive(True)
-
         return True
+
+    def save_current_scene(self):
+        print("Saving current scene")
+
+        scenes = []
+        with open(self.filename + '.json') as config_file:
+            scenes = json.load(config_file)['frames']
+
+        # Get current playback position
+        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        if not response:
+            raise Exception("Could not get playback position")
+        current_time = float(position) / Gst.SECOND
+
+        # Get current scene start point
+        # Get next scene start point
+        current_scene = None
+        next_scene = None
+        for i, scene in enumerate(scenes):
+            if float(scene['pkt_pts_time']) > float(current_time):
+                assert(i > 0)
+                next_scene = scene
+                current_scene = scenes[i-1]
+                break
+
+        self.current_scene_start = float(current_scene['pkt_pts_time'])
+        self.next_scene_start = float(next_scene['pkt_pts_time'])
+
+        print("Current scene start: " + str(self.current_scene_start))
+        print("Next scene start: " + str(self.next_scene_start))
+        print("Position: " + str(current_time))
+
+        # Go to the start of the current scene
+        self.gst_playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
+                                     self.current_scene_start * Gst.SECOND)
+
+        # Skip until the first subtitle completely within the scene is started
+        self.record_current_scene = True
+        self.record_button.handler_block(self.record_button_clicked_id)
+        self.record_button.set_active(True)
+        self.record_button.handler_unblock(self.record_button_clicked_id)
+
+        # Save clip
+        # Go to the next subtitle
+        # Keep saving clips until the current clip ends after the current scene
+
+    def pick(self):
+        # Find the current position
+        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        if not response:
+            raise Exception("Could not get playback position")
+
+        # Find the start and endpoints of the current subtitle
+        start = float(self.current_subtitle_start) / Gst.SECOND
+        duration = float(self.current_subtitle_duration) / Gst.SECOND
+
+        # Extract the image sequence for this subtitle with ffmpeg
+        subprocess.check_call('mkdir -p ' + self.config['image_root'], shell=True)
+        command = ('ffmpeg -ss ' + str(start) +
+                   ' -i \'' + self.filename + '\' -t ' +
+                   str(duration) +
+                   ' ' + self.config['image_root'] + self.clip_id() +
+                   '-%d' + self.config['image_extension'])
+        print(command)
+        subprocess.check_call(command, shell=True)
+
+        # Store the results in the JSON data file
+        self.save_clip()
 
     def save_clip(self, config_file='config.json'):
         video_pad = self.gst_playbin.emit('get-video-pad', 0)
@@ -188,11 +270,14 @@ class Main:
             json.dump(self.config, config_file, indent=2)
             print("Wrote " + str(config_file))
 
+    def seek_to(self, seconds):
+        self.gst_playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
+                                     Gst.SeekFlags.KEY_UNIT,
+                                     seconds * Gst.SECOND)
+
     def on_slider_changed(self, slider_widget, data=None):
         position = slider_widget.get_value()
-        self.gst_playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
-                                     Gst.SeekFlags.KEY_UNIT, position *
-                                     Gst.SECOND)
+        self.seek_to(position)
 
     def on_realize_video_window(self, video_widget):
         window = video_widget.get_property('window')
@@ -210,6 +295,10 @@ class Main:
             self.filename = dialog.get_filename()
             self.gst_playbin.set_property('uri', 'file://' + self.filename)
             self.gst_play()
+
+            if not os.path.isfile(self.filename + '.json'):
+                print("WARNING: Expected scene info file " + self.filename
+                      + '.json, but none was found.')
         elif response == Gtk.ResponseType.CANCEL:
             print("Cancelled file dialog")
 
@@ -229,30 +318,16 @@ class Main:
         Gtk.main_quit()
 
     def on_click_pick(self, widget, data=None):
-        # Find the current position
-        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
-        if not response:
-            raise Exception("Could not get playback position")
+        self.pick()
 
-        # Find the start and endpoints of the current subtitle
-        start = float(self.current_subtitle_start) / Gst.SECOND
-        duration = float(self.current_subtitle_duration) / Gst.SECOND
-
-        # Fetch the current subtitle
-        subtitle = self.current_subtitle
-
-        # Extract the image sequence for this subtitle with ffmpeg
-        subprocess.check_call('mkdir -p ' + self.config['image_root'], shell=True)
-        command = ('ffmpeg -ss ' + str(start) +
-                   ' -i \'' + self.filename + '\' -t ' +
-                   str(duration) +
-                   ' ' + self.config['image_root'] + self.clip_id() +
-                   '-%d' + self.config['image_extension'])
-        print(command)
-        subprocess.check_call(command, shell=True)
-
-        # Store the results in the JSON data file
-        self.save_clip()
+    def on_click_record(self, widget, data=None):
+        if self.record_current_scene:
+            self.record_current_scene = False
+            self.record_button.handler_block(self.record_button_clicked_id)
+            self.record_button.set_active(False)
+            self.record_button.handler_unblock(self.record_button_clicked_id)
+        else:
+            self.save_current_scene()
 
     def on_subtitle_sample(self, sink, data):
         sample = sink.emit('pull-sample')
@@ -267,6 +342,24 @@ class Main:
         if not response:
             raise Exception("Could not get playback position")
         self.current_subtitle_start = position
+
+        # If recording current scene, save the clip
+        if self.record_current_scene:
+            print("Maybe recording this clip")
+            current_subtitle_end = (self.current_subtitle_start +
+                                    self.current_subtitle_duration) / Gst.SECOND
+
+            if current_subtitle_end >= self.next_scene_start:
+                print("Clip subtitles end after current scene")
+                self.record_current_scene = False
+                self.record_button.handler_block(self.record_button_clicked_id)
+                self.record_button.set_active(False)
+                self.record_button.handler_unblock(self.record_button_clicked_id)
+            else:
+                print("Saving current clip")
+                threading.Thread(target=self.pick, name="Clip extractor").start()
+                # self.pick()
+                # self.seek_to(current_subtitle_end)
 
         return False
 
@@ -303,8 +396,8 @@ class Main:
 
 
 if __name__ == '__main__':
+    GObject.threads_init()
     Gtk.init(sys.argv)
     Gst.init(sys.argv)
     Main()
-    GObject.threads_init()
     Gtk.main()
