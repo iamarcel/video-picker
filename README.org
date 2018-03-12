@@ -1,0 +1,29 @@
+* Video Picker
+
+This is a Python/Gtk+3/Gstreamer-based application, written for my thesis on
+social robots, to build the dataset.
+
+Given a video with subtitles and metadata from ~ffprobe~ about the shots in a
+video, this extracts an image sequence corresponsing to every sentence in the
+subtitles.
+
+** Requirements
+
+*** Fedora: Rebuilding ~gstreamer1-plugins-good~
+
+The Fedora pagage ~gstreamer1-plugins-good~ has the Gstreamer ~cairo~ plugin
+disabled, so we need to modify that and build it ourselves.
+
+A specfile based on version 1.12.4-1 is included in this repo.
+
+#+BEGIN_SRC sh
+sudo dnf install rpm-build
+dnf download --source gstreamer1-plugins-good
+rpm -i gstreamer1-plugins-good-1.12.4-1.fc27.src.rpm
+cd ~/rpmbuild/SPECS
+vim gstreamer1-plugins-good.spec
+# Enable cairo, add dependencies (for 1.12.4-1, you can use the specfile in this repo)
+sudo dnf builddep gstreamer1-plugins-good.spec
+rpmbuild -ba gstreamer1-plugins-good.spec
+sudo rpm -U ~/rpmbuild/RPMS/x86_64/gstreamer1-plugins-good-1.12.4-2.fc27.x86_64.rpm
+#+END_SRC
