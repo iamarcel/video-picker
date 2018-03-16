@@ -11,12 +11,16 @@ import threading
 import json
 import math
 
+import cairo
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 gi.require_version('Gtk', '3.0')
 gi.require_version('GdkX11', '3.0')
+gi.require_foreign('cairo')
 from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib, Gdk  # noqa: E402
+
+import utils  # noqa: E402
 
 
 class Main:
@@ -27,10 +31,18 @@ class Main:
         with open(config_file) as config_file:
             self.config = json.load(config_file)
 
-        self.build_ui()
+        self.video_scale = 1.0
+        self.video_margin = (0, 0)
+        self.center_position = (0, 0)
+        self.detection_scale = 4.5
+        self.gst_src = None
+        self.window_size = (50, 50)
+
         self.build_gst()
+        self.build_ui()
 
         self.filename = ''
+        self.framerate = 1.0
         self.current_subtitle = ""
         self.current_subtitle_duration = 0
         self.current_subtitle_start = 0
@@ -48,8 +60,26 @@ class Main:
         vbox = Gtk.VBox()
         self.window.add(vbox)
 
+        # self.overlay = Gtk.Overlay()
+        # vbox.add(self.overlay)
+
         self.video_window = Gtk.DrawingArea()
         self.video_window.connect('realize', self.on_realize_video_window)
+        self.video_window.connect('size-allocate',
+                                  self.on_video_window_resize)
+        self.video_window.connect('button-press-event',
+                                  self.on_video_window_click)
+        self.video_window.connect('motion-notify-event',
+                                  self.on_video_window_click)
+        self.video_window.connect('scroll-event',
+                                  self.on_video_window_scroll)
+        self.video_window.set_events(self.video_window.get_events() |
+                                     Gdk.EventMask.BUTTON_PRESS_MASK |
+                                     Gdk.EventMask.BUTTON_MOTION_MASK |
+                                     Gdk.EventMask.BUTTON1_MOTION_MASK |
+                                     Gdk.EventMask.BUTTON2_MOTION_MASK |
+                                     Gdk.EventMask.BUTTON3_MOTION_MASK |
+                                     Gdk.EventMask.SCROLL_MASK)
         vbox.add(self.video_window)
 
         self.subtitle_label = Gtk.Label("...")
@@ -110,15 +140,43 @@ class Main:
         self.gst_pipeline = Gst.Pipeline()
         self.gst_state = Gst.State.NULL
 
-        self.gst_playbin = Gst.ElementFactory.make('playbin')
-        self.gst_playbin.set_property('subtitle-font-desc', 'Sans, 18')
-        self.gst_pipeline.add(self.gst_playbin)
+        self.gst_src = Gst.ElementFactory.make('playbin')
+        self.gst_src.connect('pad-added', self.on_pad_added)
+        self.gst_pipeline.add(self.gst_src)
+
+        # Set up video output bin
+        # (GhostPad:sink) my-video-bin
+        #     (queue > cairooverlay > videoconvert > autovideosink)
+        self.gst_video_bin = Gst.Bin.new('my-video-bin')
+
+        self.gst_video_queue = Gst.ElementFactory.make('queue')
+        self.gst_video_bin.add(self.gst_video_queue)
+
+        self.gst_overlay = Gst.ElementFactory.make('cairooverlay')
+        self.gst_overlay.connect('draw', self.on_draw_scale_preview)
+        self.gst_video_bin.add(self.gst_overlay)
+        self.gst_video_queue.link(self.gst_overlay)
+
+        self.gst_convert = Gst.ElementFactory.make('videoconvert')
+        self.gst_video_bin.add(self.gst_convert)
+        self.gst_overlay.link(self.gst_convert)
+
+        self.gst_video_sink = Gst.ElementFactory.make('autovideosink')
+        self.gst_video_bin.add(self.gst_video_sink)
+        self.gst_convert.link(self.gst_video_sink)
+
+        self.gst_video_sink_pad = self.gst_video_queue.get_static_pad('sink')
+        self.gst_video_ghost_pad = Gst.GhostPad.new(
+            'sink', self.gst_video_sink_pad)
+        self.gst_video_ghost_pad.set_active(True)
+        self.gst_video_bin.add_pad(self.gst_video_ghost_pad)
+
+        self.gst_src.set_property('video-sink', self.gst_video_bin)
 
         self.gst_subtitle_sink = Gst.ElementFactory.make('appsink')
         self.gst_subtitle_sink.set_property('emit-signals', True)
         self.gst_subtitle_sink.connect('new-sample', self.on_subtitle_sample, self.gst_subtitle_sink)
-
-        self.gst_playbin.set_property('text-sink', self.gst_subtitle_sink)
+        self.gst_src.set_property('text-sink', self.gst_subtitle_sink)
 
         bus = self.gst_pipeline.get_bus()
         bus.add_signal_watch()
@@ -154,7 +212,7 @@ class Main:
         if self.gst_state != Gst.State.PLAYING:
             return True
 
-        response, duration = self.gst_playbin.query_duration(Gst.Format.TIME)
+        response, duration = self.gst_src.query_duration(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback duration")
 
@@ -162,7 +220,7 @@ class Main:
         self.slider.set_range(0, duration / Gst.SECOND)
         self.slider.handler_unblock(self.slider_update_signal_id)
 
-        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        response, position = self.gst_src.query_position(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback position")
 
@@ -181,7 +239,7 @@ class Main:
             scenes = json.load(config_file)['frames']
 
         # Get current playback position
-        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        response, position = self.gst_src.query_position(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback position")
         current_time = float(position) / Gst.SECOND
@@ -205,7 +263,7 @@ class Main:
         print("Position: " + str(current_time))
 
         # Go to the start of the current scene
-        self.gst_playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
+        self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
                                      self.current_scene_start * Gst.SECOND)
 
         # Skip until the first subtitle completely within the scene is started
@@ -220,7 +278,7 @@ class Main:
 
     def pick(self):
         # Find the current position
-        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        response, position = self.gst_src.query_position(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback position")
 
@@ -242,12 +300,7 @@ class Main:
         self.save_clip()
 
     def save_clip(self, config_file='config.json'):
-        video_pad = self.gst_playbin.emit('get-video-pad', 0)
-        response = video_pad.get_current_caps().get_structure(0).get_fraction('framerate')
-        if not response[0]:
-            raise Exception("Could not get framerate")
-
-        framerate = float(response[1]) / float(response[2])
+        framerate = self.framerate
         start = math.floor(float(self.current_subtitle_start) * framerate /
                            Gst.SECOND)
         duration = math.ceil(float(self.current_subtitle_duration) * framerate
@@ -257,8 +310,8 @@ class Main:
             'id': self.clip_id(),
             'start': start,
             'end': start + duration,
-            'scale': 4.5,
-            'center': [568, 696],  # FIXME
+            'scale': self.detection_scale,
+            'center': list(self.center_position),
             'points_2d': [],
             'points_3d': [],
             'subtitle': self.current_subtitle
@@ -271,9 +324,44 @@ class Main:
             print("Wrote " + str(config_file))
 
     def seek_to(self, seconds):
-        self.gst_playbin.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
+        self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
                                      Gst.SeekFlags.KEY_UNIT,
                                      seconds * Gst.SECOND)
+
+    def update_video_margin(self):
+        if not self.gst_src:
+            return
+
+        pad = self.gst_src.emit('get-video-pad', 0)
+        if not pad:  # Pad is not ready yet
+            return
+
+        response = pad.get_current_caps().get_structure(0)
+        width = response.get_int('width')
+        if not width[0]:
+            raise Exception("Could not get video width")
+        width = width.value
+
+        height = response.get_int('height')
+        if not height[0]:
+            raise Exception("Could not get video height")
+        height = height.value
+
+        window_width, window_height = self.window_size
+
+        # Calculate resizing
+        fit_x_scale = float(window_width) / float(width)
+        fit_y_scale = float(window_height) / float(height)
+        scale = min(fit_x_scale, fit_y_scale)
+
+        self.video_scale = scale
+        self.video_margin = (
+            int((window_width - float(width) * scale) / 2),
+            int((window_height - float(height) * scale) / 2),
+        )
+
+    def set_center_position(self, position):
+        self.center_position = position
 
     def on_slider_changed(self, slider_widget, data=None):
         position = slider_widget.get_value()
@@ -293,7 +381,7 @@ class Main:
 
         if response == Gtk.ResponseType.OK:
             self.filename = dialog.get_filename()
-            self.gst_playbin.set_property('uri', 'file://' + self.filename)
+            self.gst_src.set_property('uri', 'file://' + self.filename)
             self.gst_play()
 
             if not os.path.isfile(self.filename + '.json'):
@@ -338,7 +426,7 @@ class Main:
 
         self.current_subtitle_duration = buf.duration
 
-        response, position = self.gst_playbin.query_position(Gst.Format.TIME)
+        response, position = self.gst_src.query_position(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback position")
         self.current_subtitle_start = position
@@ -363,6 +451,44 @@ class Main:
 
         return False
 
+    def on_video_window_click(self, widget, event):
+        x = (float(event.x) - self.video_margin[0]) / self.video_scale
+        y = (float(event.y) - self.video_margin[1]) / self.video_scale
+        self.center_position = (x, y)
+
+    def on_video_window_scroll(self, widget, event):
+        self.detection_scale -= 0.16 * event.delta_y
+
+    def on_video_window_resize(self, widget, rectangle):
+        self.window_size = (rectangle.width, rectangle.height)
+        self.update_video_margin()
+
+    def on_draw_scale_preview(self, overlay, draw, timestamp, duration):
+        center_x = self.center_position[0]
+        center_y = self.center_position[1]
+        top_x = center_x - self.detection_scale * 64
+        top_y = center_y - self.detection_scale * 64
+        edge_length = self.detection_scale * 128
+
+        draw.save()
+
+        draw.rectangle(top_x, top_y, edge_length, edge_length)
+        draw.rectangle(center_x, center_y, 2, 2)
+
+        draw.set_tolerance(0.1)
+        draw.set_line_width(5)
+        draw.set_source_rgba(0.0, 0.0, 0.0, 0.3)
+        draw.stroke()
+
+        draw.rectangle(top_x, top_y, edge_length, edge_length)
+        draw.rectangle(center_x, center_y, 2, 2)
+
+        draw.set_line_width(2)
+        draw.set_source_rgba(1.0, 1.0, 1.0, 0.7)
+        draw.stroke()
+
+        draw.restore()
+
     def on_message(self, bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
@@ -376,12 +502,15 @@ class Main:
             self.play_button.set_label("Play")
 
     def on_state_changed(self, bus, message):
-        if not message.src == self.gst_playbin:
+        if not message.src == self.gst_src:
             return
 
         old, new, pendmessage = message.parse_state_changed()
         self.gst_state = new
         self.update_slider()
+
+        if self.gst_state == Gst.State.PLAYING:
+            self.update_video_margin()
 
     def on_sync_message(self, bus, message):
         struct = message.get_structure()
@@ -394,10 +523,33 @@ class Main:
             message.src.set_property('force-aspect-ratio', True)
             message.src.set_window_handle(self.video_window_xid)
 
+    def on_pad_added(self, src, pad):
+        caps = pad.get_current_caps()
+        structure = caps.get_structure(0)
+        template = pad.get_pad_template()
+        if not structure:
+            raise Exception("could not get caps structure")
+
+        name = pad.query_caps(None).to_string()
+        if name.startswith('video'):
+            sink = self.gst_video_queue.get_compatible_pad(pad, caps)
+            utils.try_link(pad, sink)
+
+            response = structure.get_fraction('framerate')
+            self.framerate = float(response[1]) / float(response[2])
+        elif name.startswith('audio'):
+            sink = self.gst_audio_queue.get_compatible_pad(pad, caps)
+            utils.try_link(pad, sink)
+        elif name.startswith('text'):
+            sink = self.gst_subtitle_queue.get_compatible_pad(pad, caps)
+            pad.link(sink)
+
 
 if __name__ == '__main__':
     GObject.threads_init()
     Gtk.init(sys.argv)
     Gst.init(sys.argv)
+    Gst.debug_set_active(True)
+    Gst.debug_set_default_threshold(3)
     Main()
     Gtk.main()
