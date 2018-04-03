@@ -4,10 +4,11 @@
 Application to pick single-sentence clips from a video
 """
 
+import datetime
 import sys
 import os
+import shutil
 import subprocess
-import threading
 import json
 import math
 
@@ -19,8 +20,6 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('GdkX11', '3.0')
 gi.require_foreign('cairo')
 from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib, Gdk  # noqa: E402
-
-import utils  # noqa: E402
 
 
 class Main:
@@ -47,15 +46,30 @@ class Main:
         self.current_subtitle_duration = 0
         self.current_subtitle_start = 0
 
+        self.clips_processing = []
         self.current_scene_start = 0
         self.next_scene_start = 0
         self.record_current_scene = False
+
+        self.split_sub_lines = False
 
     def build_ui(self):
         self.window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
         self.window.set_title("Video Picker")
         self.window.set_default_size(960, 640)
         self.window.connect('destroy', Gtk.main_quit, 'WM Destroy')
+
+        self.accelerators = Gtk.AccelGroup()
+        self.accelerators.connect(
+            Gdk.keyval_from_name('O'), Gdk.ModifierType.CONTROL_MASK, 0,
+            self.on_click_open)
+        self.accelerators.connect(
+            Gdk.keyval_from_name('R'), Gdk.ModifierType.CONTROL_MASK, 0,
+            self.on_click_record)
+        self.accelerators.connect(
+            Gdk.keyval_from_name('Q'), Gdk.ModifierType.CONTROL_MASK, 0,
+            self.on_click_exit)
+        self.window.add_accel_group(self.accelerators)
 
         vbox = Gtk.VBox()
         self.window.add(vbox)
@@ -73,12 +87,9 @@ class Main:
                                   self.on_video_window_click)
         self.video_window.connect('scroll-event',
                                   self.on_video_window_scroll)
-        self.video_window.set_events(self.video_window.get_events() |
-                                     Gdk.EventMask.BUTTON_PRESS_MASK |
+        self.video_window.set_events(Gdk.EventMask.KEY_PRESS_MASK |
+                                     Gdk.EventMask.POINTER_MOTION_MASK |
                                      Gdk.EventMask.BUTTON_MOTION_MASK |
-                                     Gdk.EventMask.BUTTON1_MOTION_MASK |
-                                     Gdk.EventMask.BUTTON2_MOTION_MASK |
-                                     Gdk.EventMask.BUTTON3_MOTION_MASK |
                                      Gdk.EventMask.SCROLL_MASK)
         vbox.add(self.video_window)
 
@@ -115,13 +126,18 @@ class Main:
         self.pick_button.connect('clicked', self.on_click_pick)
         hbox.pack_start(self.pick_button, False, False, 2)
 
-        self.record_button = (
-            Gtk.ToggleButton(image=Gtk.Image.new_from_stock(Gtk.STOCK_MEDIA_RECORD,
-                                                            Gtk.IconSize.BUTTON)))
+        self.record_button = (Gtk.ToggleButton(
+            image=Gtk.Image.new_from_stock(Gtk.STOCK_MEDIA_RECORD,
+                                           Gtk.IconSize.BUTTON)))
         self.record_button.set_active(False)
         self.record_button.set_relief(Gtk.ReliefStyle.NONE)
-        self.record_button_clicked_id = self.record_button.connect('toggled', self.on_click_record)
+        self.record_button_clicked_id = self.record_button.connect(
+            'toggled', self.on_click_record)
         hbox.pack_start(self.record_button, False, False, 2)
+
+        self.subtitle_split_toggle = Gtk.CheckButton(label="Split Sub Lines")
+        self.subtitle_split_toggle.connect('toggled', self.on_toggle_sub_split)
+        hbox.pack_start(self.subtitle_split_toggle, False, False, 2)
 
         self.exit_button = Gtk.Button("Exit")
         self.exit_button.connect('clicked', self.on_click_exit)
@@ -129,8 +145,8 @@ class Main:
 
         self.slider = Gtk.HScale.new_with_range(0, 100, 0.5)
         self.slider.set_draw_value(False)
-        self.slider_update_signal_id = self.slider.connect('value-changed',
-                                                           self.on_slider_changed)
+        self.slider_update_signal_id = self.slider.connect(
+            'value-changed', self.on_slider_changed)
         hbox.pack_start(self.slider, True, True, 2)
         GLib.timeout_add(1000, self.update_slider)
 
@@ -141,7 +157,6 @@ class Main:
         self.gst_state = Gst.State.NULL
 
         self.gst_src = Gst.ElementFactory.make('playbin')
-        self.gst_src.connect('pad-added', self.on_pad_added)
         self.gst_pipeline.add(self.gst_src)
 
         # Set up video output bin
@@ -201,6 +216,16 @@ class Main:
         filename = os.path.basename(self.filename)
         return (filename.split('.')[-2].split('-')[-1] +
                 str(self.current_subtitle_start))
+
+    def clip_is_processed(self, id):
+        if id in self.clips_processing:
+            return True
+
+        for clip in self.config['clips']:
+            if clip['id'] == id:
+                return True
+
+        return False
 
     def update_slider(self):
         if self.gst_state == Gst.State.NULL or self.gst_state == Gst.State.READY:
@@ -264,13 +289,16 @@ class Main:
 
         # Go to the start of the current scene
         self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
-                                     self.current_scene_start * Gst.SECOND)
+                                 self.current_scene_start * Gst.SECOND)
 
         # Skip until the first subtitle completely within the scene is started
         self.record_current_scene = True
         self.record_button.handler_block(self.record_button_clicked_id)
         self.record_button.set_active(True)
         self.record_button.handler_unblock(self.record_button_clicked_id)
+
+        shutil.copyfile(self.config_file, self.config_file + '.bak-'
+                        + datetime.datetime.now().isoformat())
 
         # Save clip
         # Go to the next subtitle
@@ -288,11 +316,13 @@ class Main:
 
         # Extract the image sequence for this subtitle with ffmpeg
         subprocess.check_call('mkdir -p ' + self.config['image_root'], shell=True)
-        command = ('ffmpeg -ss ' + str(start) +
+        command = ('ffmpeg' +
+                   ' -loglevel quiet' +
+                   ' -ss ' + str(start) +
                    ' -i \'' + self.filename + '\' -t ' +
                    str(duration) +
                    ' ' + self.config['image_root'] + self.clip_id() +
-                   '-%d' + self.config['image_extension'])
+                   '-%6d' + self.config['image_extension'])
         print(command)
         subprocess.check_call(command, shell=True)
 
@@ -300,14 +330,21 @@ class Main:
         self.save_clip()
 
     def save_clip(self, config_file='config.json'):
+        id = self.clip_id()
+        if self.clip_is_processed(id):
+            return
+        self.clips_processing.append(id)
+
         framerate = self.framerate
         start = math.floor(float(self.current_subtitle_start) * framerate /
                            Gst.SECOND)
         duration = math.ceil(float(self.current_subtitle_duration) * framerate
                              / Gst.SECOND)
+        if duration <= 15:
+            return  # Skip if shorter than 15 frames
 
         clip = {
-            'id': self.clip_id(),
+            'id': id,
             'start': start,
             'end': start + duration,
             'scale': self.detection_scale,
@@ -322,6 +359,8 @@ class Main:
         with open(self.config_file, 'w') as config_file:
             json.dump(self.config, config_file, indent=2)
             print("Wrote " + str(config_file))
+
+        self.clips_processing.remove(id)
 
     def seek_to(self, seconds):
         self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
@@ -371,7 +410,7 @@ class Main:
         window = video_widget.get_property('window')
         self.video_window_xid = window.get_xid()
 
-    def on_click_open(self, widget, data=None):
+    def on_click_open(self, *args, **kwargs):
         dialog = Gtk.FileChooserDialog("Choose a video file", self.window,
                                        Gtk.FileChooserAction.OPEN,
                                        (Gtk.STOCK_CANCEL,
@@ -401,14 +440,14 @@ class Main:
     def on_click_pause(self, widget, data=None):
         self.gst_pause()
 
-    def on_click_exit(self, widget, data=None):
+    def on_click_exit(self, *args, **kwargs):
         self.gst_pipeline.set_state(Gst.State.NULL)
         Gtk.main_quit()
 
     def on_click_pick(self, widget, data=None):
         self.pick()
 
-    def on_click_record(self, widget, data=None):
+    def on_click_record(self, *args, **kwargs):
         if self.record_current_scene:
             self.record_current_scene = False
             self.record_button.handler_block(self.record_button_clicked_id)
@@ -421,32 +460,37 @@ class Main:
         sample = sink.emit('pull-sample')
         buf = sample.get_buffer()
 
-        self.current_subtitle = str(buf.extract_dup(0, buf.get_size()))
+        subtitle = buf.extract_dup(0, buf.get_size()).decode('UTF-8')
+
+        if self.split_sub_lines:
+            self.current_subtitle = subtitle.split('\n')[-1]
+        else:
+            self.current_subtitle = subtitle.replace('\n', ' ')
+
         self.subtitle_label.set_markup(self.current_subtitle)
 
         self.current_subtitle_duration = buf.duration
-
-        response, position = self.gst_src.query_position(Gst.Format.TIME)
-        if not response:
-            raise Exception("Could not get playback position")
-        self.current_subtitle_start = position
+        self.current_subtitle_start = buf.pts
 
         # If recording current scene, save the clip
         if self.record_current_scene:
             print("Maybe recording this clip")
             current_subtitle_end = (self.current_subtitle_start +
                                     self.current_subtitle_duration) / Gst.SECOND
+            current_subtitle_start = self.current_subtitle_start / Gst.SECOND
 
             if current_subtitle_end >= self.next_scene_start:
                 print("Clip subtitles end after current scene")
                 self.record_current_scene = False
                 self.record_button.handler_block(self.record_button_clicked_id)
                 self.record_button.set_active(False)
-                self.record_button.handler_unblock(self.record_button_clicked_id)
+                self.record_button.handler_unblock(
+                    self.record_button_clicked_id)
+            elif current_subtitle_start < self.current_scene_start:
+                print("Clip subtitles start before current scene")
             else:
                 print("Saving current clip")
-                threading.Thread(target=self.pick, name="Clip extractor").start()
-                # self.pick()
+                self.pick()
                 # self.seek_to(current_subtitle_end)
 
         return False
@@ -455,6 +499,9 @@ class Main:
         x = (float(event.x) - self.video_margin[0]) / self.video_scale
         y = (float(event.y) - self.video_margin[1]) / self.video_scale
         self.center_position = (x, y)
+
+    def on_toggle_sub_split(self, widget):
+        self.split_sub_lines = widget.get_active()
 
     def on_video_window_scroll(self, widget, event):
         self.detection_scale -= 0.16 * event.delta_y
@@ -484,7 +531,10 @@ class Main:
         draw.rectangle(center_x, center_y, 2, 2)
 
         draw.set_line_width(2)
-        draw.set_source_rgba(1.0, 1.0, 1.0, 0.7)
+        if self.record_current_scene:
+            draw.set_source_rgba(1.0, 0.0, 0.0, 0.8)
+        else:
+            draw.set_source_rgba(1.0, 1.0, 1.0, 0.7)
         draw.stroke()
 
         draw.restore()
@@ -509,6 +559,11 @@ class Main:
         self.gst_state = new
         self.update_slider()
 
+        if self.gst_state == Gst.State.PAUSED:
+            pad = self.gst_src.emit('get-video-pad', 0)
+            response = pad.get_current_caps().get_structure(0).get_fraction('framerate')
+            self.framerate = float(response[1]) / float(response[2])
+
         if self.gst_state == Gst.State.PLAYING:
             self.update_video_margin()
 
@@ -523,33 +578,12 @@ class Main:
             message.src.set_property('force-aspect-ratio', True)
             message.src.set_window_handle(self.video_window_xid)
 
-    def on_pad_added(self, src, pad):
-        caps = pad.get_current_caps()
-        structure = caps.get_structure(0)
-        template = pad.get_pad_template()
-        if not structure:
-            raise Exception("could not get caps structure")
-
-        name = pad.query_caps(None).to_string()
-        if name.startswith('video'):
-            sink = self.gst_video_queue.get_compatible_pad(pad, caps)
-            utils.try_link(pad, sink)
-
-            response = structure.get_fraction('framerate')
-            self.framerate = float(response[1]) / float(response[2])
-        elif name.startswith('audio'):
-            sink = self.gst_audio_queue.get_compatible_pad(pad, caps)
-            utils.try_link(pad, sink)
-        elif name.startswith('text'):
-            sink = self.gst_subtitle_queue.get_compatible_pad(pad, caps)
-            pad.link(sink)
-
 
 if __name__ == '__main__':
     GObject.threads_init()
     Gtk.init(sys.argv)
     Gst.init(sys.argv)
-    Gst.debug_set_active(True)
-    Gst.debug_set_default_threshold(3)
+    # Gst.debug_set_active(True)
+    # Gst.debug_set_default_threshold(3)
     Main()
     Gtk.main()
