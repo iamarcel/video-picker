@@ -280,16 +280,32 @@ class Main:
                 current_scene = scenes[i-1]
                 break
 
-        self.current_scene_start = float(current_scene['pkt_pts_time'])
-        self.next_scene_start = float(next_scene['pkt_pts_time'])
+        if current_scene is not None:
+            # Seek to start of scene
+            self.current_scene_start = float(current_scene['pkt_pts_time'])
+            self.next_scene_start = float(next_scene['pkt_pts_time'])
 
-        print("Current scene start: " + str(self.current_scene_start))
-        print("Next scene start: " + str(self.next_scene_start))
-        print("Position: " + str(current_time))
+            print("Current scene start: " + str(self.current_scene_start))
+            print("Next scene start: " + str(self.next_scene_start))
+            print("Position: " + str(current_time))
 
-        # Go to the start of the current scene
-        self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
-                                 self.current_scene_start * Gst.SECOND)
+            # Go to the start of the current scene
+            self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH,
+                                     self.current_scene_start * Gst.SECOND)
+        else:
+            # Start recording at the current point
+            self.current_scene_start = current_time
+
+            if next_scene is not None:
+                # Set the next scene if there's one
+                self.next_scene_start = float(next_scene['pkt_pts_time'])
+            else:
+                # Set next scene to end of file
+                response, duration = (
+                    self.gst_src.query_duration(Gst.Format.TIME))
+                if not response:
+                    raise Exception("Could not get video duration")
+                self.next_scene_start = float(duration) / Gst.SECOND
 
         # Skip until the first subtitle completely within the scene is started
         self.record_current_scene = True
