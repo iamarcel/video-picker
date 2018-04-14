@@ -8,9 +8,11 @@ import datetime
 import sys
 import os
 import shutil
+import shlex
 import subprocess
 import json
 import math
+import logging
 
 import cairo
 import gi
@@ -20,6 +22,11 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('GdkX11', '3.0')
 gi.require_foreign('cairo')
 from gi.repository import Gst, GObject, Gtk, GdkX11, GstVideo, GLib, Gdk  # noqa: E402
+
+import common.data_utils
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 class Main:
@@ -41,6 +48,7 @@ class Main:
         self.build_ui()
 
         self.filename = ''
+        self.scenes = []
         self.framerate = 1.0
         self.current_subtitle = ""
         self.current_subtitle_duration = 0
@@ -53,11 +61,14 @@ class Main:
 
         self.split_sub_lines = False
 
+        self.writer = common.data_utils.ClipWriter()
+
     def build_ui(self):
         self.window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
         self.window.set_title("Video Picker")
         self.window.set_default_size(960, 640)
         self.window.connect('destroy', Gtk.main_quit, 'WM Destroy')
+        self.window.connect('delete-event', self.on_quit)
 
         self.accelerators = Gtk.AccelGroup()
         self.accelerators.connect(
@@ -69,6 +80,9 @@ class Main:
         self.accelerators.connect(
             Gdk.keyval_from_name('Q'), Gdk.ModifierType.CONTROL_MASK, 0,
             self.on_click_exit)
+        self.accelerators.connect(
+            Gdk.keyval_from_name('L'), Gdk.ModifierType.CONTROL_MASK, 0,
+            self.seek_to_next_scene)
         self.window.add_accel_group(self.accelerators)
 
         vbox = Gtk.VBox()
@@ -259,26 +273,13 @@ class Main:
     def save_current_scene(self):
         print("Saving current scene")
 
-        scenes = []
-        with open(self.filename + '.json') as config_file:
-            scenes = json.load(config_file)['frames']
-
         # Get current playback position
         response, position = self.gst_src.query_position(Gst.Format.TIME)
         if not response:
             raise Exception("Could not get playback position")
         current_time = float(position) / Gst.SECOND
 
-        # Get current scene start point
-        # Get next scene start point
-        current_scene = None
-        next_scene = None
-        for i, scene in enumerate(scenes):
-            if float(scene['pkt_pts_time']) > float(current_time):
-                assert(i > 0)
-                next_scene = scene
-                current_scene = scenes[i-1]
-                break
+        current_scene, next_scene = self.get_scene(current_time=current_time)
 
         if current_scene is not None:
             # Seek to start of scene
@@ -332,15 +333,19 @@ class Main:
 
         # Extract the image sequence for this subtitle with ffmpeg
         subprocess.check_call('mkdir -p ' + self.config['image_root'], shell=True)
-        command = ('ffmpeg' +
-                   ' -loglevel quiet' +
-                   ' -ss ' + str(start) +
-                   ' -i \'' + self.filename + '\' -t ' +
-                   str(duration) +
-                   ' ' + self.config['image_root'] + self.clip_id() +
-                   '-%6d' + self.config['image_extension'])
-        print(command)
-        subprocess.check_call(command, shell=True)
+        command = [
+            'ffmpeg',
+            '-loglevel', 'quiet',
+            '-ss', str(start),
+            '-t', str(duration),
+            '-i', self.filename,
+            os.path.join(
+                os.getcwd(),
+                self.config['image_root'] + self.clip_id() + '-%6d' + self.config['image_extension']
+            )
+        ]
+        logging.info(" ".join([shlex.quote(c) for c in command]))
+        subprocess.Popen(command, shell=False)
 
         # Store the results in the JSON data file
         self.save_clip()
@@ -348,6 +353,7 @@ class Main:
     def save_clip(self, config_file='config.json'):
         id = self.clip_id()
         if self.clip_is_processed(id):
+            logging.info("Clip is already processed. Not saving.")
             return
         self.clips_processing.append(id)
 
@@ -357,6 +363,7 @@ class Main:
         duration = math.ceil(float(self.current_subtitle_duration) * framerate
                              / Gst.SECOND)
         if duration <= 15:
+            logging.info("Clip is too short. Skipping.")
             return  # Skip if shorter than 15 frames
 
         clip = {
@@ -371,17 +378,48 @@ class Main:
         }
 
         self.config['clips'].append(clip)
+        logger.debug("Sending clip to writer")
+        self.writer.send(clip)
 
-        with open(self.config_file, 'w') as config_file:
-            json.dump(self.config, config_file, indent=2)
-            print("Wrote " + str(config_file))
+        # with open(self.config_file, 'w') as config_file:
+        #     json.dump(self.config, config_file, indent=2)
+        #     print("Wrote " + str(config_file))
 
         self.clips_processing.remove(id)
 
+    def get_scene(self, current_time=None):
+        if current_time is None:
+            # Get current playback position
+            response, position = self.gst_src.query_position(Gst.Format.TIME)
+            if not response:
+                raise Exception("Could not get playback position")
+            current_time = float(position) / Gst.SECOND
+
+        # Get current scene start point
+        # Get next scene start point
+        current_scene = None
+        next_scene = None
+        for i, scene in enumerate(self.scenes):
+            if float(scene['pkt_pts_time']) > float(current_time):
+                next_scene = scene
+                if i > 0:
+                    current_scene = self.scenes[i-1]
+                break
+
+        return current_scene, next_scene
+
     def seek_to(self, seconds):
-        self.gst_src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH |
-                                     Gst.SeekFlags.KEY_UNIT,
-                                     seconds * Gst.SECOND)
+        self.gst_src.seek_simple(
+            Gst.Format.TIME,
+            (Gst.SeekFlags.FLUSH |
+             Gst.SeekFlags.ACCURATE),
+            seconds * Gst.SECOND
+        )
+
+    def seek_to_next_scene(self, *args):
+        _, next_scene = self.get_scene()
+        if next_scene is not None:
+            self.seek_to(float(next_scene['pkt_pts_time']))
 
     def update_video_margin(self):
         if not self.gst_src:
@@ -442,6 +480,9 @@ class Main:
             if not os.path.isfile(self.filename + '.json'):
                 print("WARNING: Expected scene info file " + self.filename
                       + '.json, but none was found.')
+            else:
+                with open(self.filename + '.json') as probe_file:
+                    self.scenes = json.load(probe_file)['frames']
         elif response == Gtk.ResponseType.CANCEL:
             print("Cancelled file dialog")
 
@@ -457,8 +498,7 @@ class Main:
         self.gst_pause()
 
     def on_click_exit(self, *args, **kwargs):
-        self.gst_pipeline.set_state(Gst.State.NULL)
-        Gtk.main_quit()
+        self.window.close()
 
     def on_click_pick(self, widget, data=None):
         self.pick()
@@ -554,6 +594,13 @@ class Main:
         draw.stroke()
 
         draw.restore()
+
+    def on_quit(self, widget, event, data=None):
+        logger.info("Stopping pipeline")
+        self.gst_pipeline.set_state(Gst.State.NULL)
+        logger.info("Closing clip writer")
+        self.writer.close()
+        return False  # Don't cancel quit
 
     def on_message(self, bus, message):
         t = message.type

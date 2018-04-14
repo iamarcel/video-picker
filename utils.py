@@ -5,6 +5,7 @@ Utility functions for video-picker
 """
 
 import gi
+import tensorflow as tf
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst  # noqa: E402
 
