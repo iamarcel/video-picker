@@ -9,6 +9,7 @@ import sys
 import os
 import shutil
 import shlex
+import pipes
 import subprocess
 import json
 import math
@@ -61,6 +62,7 @@ class Main:
 
         self.split_sub_lines = False
 
+        self.processed_clip_ids = common.data_utils.get_clip_ids()
         self.writer = common.data_utils.ClipWriter()
 
     def build_ui(self):
@@ -81,8 +83,11 @@ class Main:
             Gdk.keyval_from_name('Q'), Gdk.ModifierType.CONTROL_MASK, 0,
             self.on_click_exit)
         self.accelerators.connect(
-            Gdk.keyval_from_name('L'), Gdk.ModifierType.CONTROL_MASK, 0,
+            Gdk.keyval_from_name('F'), Gdk.ModifierType.CONTROL_MASK, 0,
             self.seek_to_next_scene)
+        self.accelerators.connect(
+            Gdk.keyval_from_name('D'), Gdk.ModifierType.CONTROL_MASK, 0,
+            self.seek_to_previous_scene)
         self.window.add_accel_group(self.accelerators)
 
         vbox = Gtk.VBox()
@@ -235,11 +240,28 @@ class Main:
         if id in self.clips_processing:
             return True
 
-        for clip in self.config['clips']:
-            if clip['id'] == id:
-                return True
+        if id in self.processed_clip_ids:
+            return True
 
         return False
+
+    def current_clip_alignment(self):
+        current_scene, next_scene, _ = self.get_scene()
+
+        if current_scene is not None:
+            self.current_scene_start = float(current_scene['pkt_pts_time'])
+            self.next_scene_start = float(next_scene['pkt_pts_time'])
+
+        current_subtitle_end = (self.current_subtitle_start +
+                                self.current_subtitle_duration) / Gst.SECOND
+        current_subtitle_start = self.current_subtitle_start / Gst.SECOND
+
+        if current_subtitle_end >= self.next_scene_start:
+            return 1
+        elif current_subtitle_start < self.current_scene_start:
+            return -1
+        else:
+            return 0
 
     def update_slider(self):
         if self.gst_state == Gst.State.NULL or self.gst_state == Gst.State.READY:
@@ -279,7 +301,7 @@ class Main:
             raise Exception("Could not get playback position")
         current_time = float(position) / Gst.SECOND
 
-        current_scene, next_scene = self.get_scene(current_time=current_time)
+        current_scene, next_scene, _ = self.get_scene(current_time=current_time)
 
         if current_scene is not None:
             # Seek to start of scene
@@ -344,7 +366,7 @@ class Main:
                 self.config['image_root'] + self.clip_id() + '-%6d' + self.config['image_extension']
             )
         ]
-        logging.info(" ".join([shlex.quote(c) for c in command]))
+        logging.info(" ".join([pipes.quote(c) for c in command]))
         subprocess.Popen(command, shell=False)
 
         # Store the results in the JSON data file
@@ -378,14 +400,10 @@ class Main:
         }
 
         self.config['clips'].append(clip)
-        logger.debug("Sending clip to writer")
         self.writer.send(clip)
 
-        # with open(self.config_file, 'w') as config_file:
-        #     json.dump(self.config, config_file, indent=2)
-        #     print("Wrote " + str(config_file))
-
         self.clips_processing.remove(id)
+        self.processed_clip_ids.append(id)
 
     def get_scene(self, current_time=None):
         if current_time is None:
@@ -399,14 +417,17 @@ class Main:
         # Get next scene start point
         current_scene = None
         next_scene = None
+        previous_scene = None
         for i, scene in enumerate(self.scenes):
             if float(scene['pkt_pts_time']) > float(current_time):
                 next_scene = scene
                 if i > 0:
                     current_scene = self.scenes[i-1]
+                if i > 1:
+                    previous_scene = self.scenes[i-2]
                 break
 
-        return current_scene, next_scene
+        return current_scene, next_scene, previous_scene
 
     def seek_to(self, seconds):
         self.gst_src.seek_simple(
@@ -417,9 +438,14 @@ class Main:
         )
 
     def seek_to_next_scene(self, *args):
-        _, next_scene = self.get_scene()
+        _, next_scene, _ = self.get_scene()
         if next_scene is not None:
             self.seek_to(float(next_scene['pkt_pts_time']))
+
+    def seek_to_previous_scene(self, *args):
+        _, _, previous_scene = self.get_scene()
+        if previous_scene is not None:
+            self.seek_to(float(previous_scene['pkt_pts_time']))
 
     def update_video_margin(self):
         if not self.gst_src:
@@ -531,23 +557,20 @@ class Main:
         # If recording current scene, save the clip
         if self.record_current_scene:
             print("Maybe recording this clip")
-            current_subtitle_end = (self.current_subtitle_start +
-                                    self.current_subtitle_duration) / Gst.SECOND
-            current_subtitle_start = self.current_subtitle_start / Gst.SECOND
 
-            if current_subtitle_end >= self.next_scene_start:
+            alignment = self.current_clip_alignment()
+            if alignment == 1:
                 print("Clip subtitles end after current scene")
                 self.record_current_scene = False
                 self.record_button.handler_block(self.record_button_clicked_id)
                 self.record_button.set_active(False)
                 self.record_button.handler_unblock(
                     self.record_button_clicked_id)
-            elif current_subtitle_start < self.current_scene_start:
+            elif alignment == -1:
                 print("Clip subtitles start before current scene")
             else:
                 print("Saving current clip")
                 self.pick()
-                # self.seek_to(current_subtitle_end)
 
         return False
 
@@ -572,6 +595,7 @@ class Main:
         top_x = center_x - self.detection_scale * 64
         top_y = center_y - self.detection_scale * 64
         edge_length = self.detection_scale * 128
+        alpha = 1.0 if self.current_clip_alignment() == 0 else 0.3
 
         draw.save()
 
@@ -580,7 +604,7 @@ class Main:
 
         draw.set_tolerance(0.1)
         draw.set_line_width(5)
-        draw.set_source_rgba(0.0, 0.0, 0.0, 0.3)
+        draw.set_source_rgba(0.0, 0.0, 0.0, 0.3 * alpha)
         draw.stroke()
 
         draw.rectangle(top_x, top_y, edge_length, edge_length)
@@ -588,9 +612,11 @@ class Main:
 
         draw.set_line_width(2)
         if self.record_current_scene:
-            draw.set_source_rgba(1.0, 0.0, 0.0, 0.8)
+            draw.set_source_rgba(1.0, 0.0, 0.0, 0.8 * alpha)
+        elif self.clip_is_processed(self.clip_id()):
+            draw.set_source_rgba(.54, .9, .05, 0.7 * alpha)
         else:
-            draw.set_source_rgba(1.0, 1.0, 1.0, 0.7)
+            draw.set_source_rgba(1.0, 1.0, 1.0, 0.7 * alpha)
         draw.stroke()
 
         draw.restore()
